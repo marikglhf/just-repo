@@ -1,0 +1,115 @@
+// src/test/java/perf/CriteriaUseCasePerfTest.java
+package perf;
+
+import org.junit.jupiter.api.*;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.Mockito;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.moditect.jfrunit.JfrEvents;
+
+import java.time.Duration;
+import java.util.*;
+import java.util.stream.IntStream;
+
+/**
+ * Меряем:
+ *  - среднее время вызова calculate() (после короткой разминки)
+ *  - аллокации памяти на вызов (через JFR)
+ *
+ * employeePort/workloadPort замоканы → для одинаковых входов поведение неизменно.
+ * CalculateRequest/Context тоже замокаем, чтобы не зависеть от их конструкторов/билдеров.
+ */
+@ExtendWith(MockitoExtension.class)
+class CriteriaUseCasePerfTest {
+
+  @Mock EmployeePort employeePort;   // всегда одинаковые ответы для заданных ids
+  @Mock WorkloadPort workloadPort;
+
+  // Расширение JfrUnit: ловим события аллокаций из JVM Flight Recorder
+  @RegisterExtension static final JfrEvents jfr = new JfrEvents();
+
+  CriteriaUseCase useCase;
+
+  // Параметры сценария — подстройте под свой CI/цели
+  static final int N_CANDIDATES = 5_000;
+  static final int WARMUP_ITERS = 5;
+  static final int MEASURE_ITERS = 20;
+
+  // Вход: кандидаты (минимум полей), и два вида запроса
+  Collection<CandidateDto> initial;
+  CalculateRequest reqWithBitl;
+  CalculateRequest reqWithoutBitl;
+
+  @BeforeEach
+  void setUp() {
+    // --- 1) Детерминированные данные для портов (без случайности) ---
+    Map<String, EmployeePort.EmployeeDto> employees = new HashMap<>();
+    Map<String, WorkloadPort.WorkloadDto> workloads = new HashMap<>();
+
+    for (int i = 0; i < N_CANDIDATES; i++) {
+      String id = "emp-" + i;
+      employees.put(id, new EmployeePort.EmployeeDto(id, /*isBitl:*/ (i % 2 == 0)));
+      workloads.put(id, new WorkloadPort.WorkloadDto(id, /*workload:*/ 1 + (i % 10))); // 1..10 — исключаем деление на ноль
+    }
+
+    // --- 2) Стабильные моки портов: возвращают из предзаполненных map ---
+    Mockito.when(employeePort.findEmployee(Mockito.anySet()))
+      .thenAnswer(inv -> ((Set<String>) inv.getArgument(0)).stream().map(employees::get).toList());
+
+    Mockito.when(workloadPort.findEmployeeWorkload(Mockito.anySet()))
+      .thenAnswer(inv -> ((Set<String>) inv.getArgument(0)).stream().map(workloads::get).toList());
+
+    // --- 3) Ваш реальный use case ---
+    useCase = new CriteriaUseCase(employeePort, workloadPort);
+
+    // --- 4) Входные кандидаты: минимально и без лишних либ ---
+    initial = IntStream.range(0, N_CANDIDATES)
+      .mapToObj(i -> CandidateDto.builder().employeeId("emp-" + i).score(0).build())
+      .toList();
+
+    // --- 5) Запросы: мокаем, чтобы не зависеть от конкретного API конструкторов ---
+    reqWithBitl = Mockito.mock(CalculateRequest.class);
+    reqWithoutBitl = Mockito.mock(CalculateRequest.class);
+    Context ctxTrue = Mockito.mock(Context.class);
+    Context ctxFalse = Mockito.mock(Context.class);
+    Mockito.when(ctxTrue.isBitl()).thenReturn(true);
+    Mockito.when(ctxFalse.isBitl()).thenReturn(false);
+    Mockito.when(reqWithBitl.context()).thenReturn(ctxTrue);
+    Mockito.when(reqWithoutBitl.context()).thenReturn(ctxFalse);
+  }
+
+  @Test
+  void withBitl_timeAndAlloc() {
+    runScenario("withBitl", reqWithBitl, /*µs/op*/ 30_000, /*B/op*/ 3_000);
+  }
+
+  @Test
+  void withoutBitl_timeAndAlloc() {
+    runScenario("withoutBitl", reqWithoutBitl, /*µs/op*/ 25_000, /*B/op*/ 2_500);
+  }
+
+  /**
+   * Общий прогон: короткая разминка, затем измерения + сбор JFR событий аллокаций.
+   * Пороговые значения — простые ассёрты, чтобы сигнализировать деградацию.
+   */
+  private void runScenario(String label, CalculateRequest request, long usBudgetPerOp, long bytesBudgetPerOp) {
+    // Разминка (прогреваем JIT и структуры данных)
+    for (int i = 0; i < WARMUP_ITERS; i++) {
+      useCase.calculate(initial, request);
+    }
+
+    // Включаем события аллокаций и стартуем запись JFR
+    jfr.recording().enable("jdk.ObjectAllocationInNewTLAB").withThreshold(Duration.ZERO);
+    jfr.recording().enable("jdk.ObjectAllocationOutsideTLAB").withThreshold(Duration.ZERO);
+    jfr.start();
+
+    long t0 = System.nanoTime();
+    int sanity = 0; // чуть-чуть «используем» результат, чтобы JIT не выкинул
+    for (int i = 0; i < MEASURE_ITERS; i++) {
+      CalculateResponse r = useCase.calculate(initial, request);
+      sanity += r.candidates().size();
+    }
+    long t1 = System.nanoTime();
+    jfr.stop();
+    Assertions.assertTrue(sanity > 0, "sanity check failed
